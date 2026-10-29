@@ -1,0 +1,5 @@
+secure-input
+*.test
+.env
+.env.*
+!.env.example
