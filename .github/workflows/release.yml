@@ -46,9 +46,54 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload artifacts
+      # One artifact per platform, so each shows up as its own download on
+      # the run's Summary page. Raw binaries and goreleaser metadata in dist/
+      # are left out; the archives already contain the binaries.
+      - name: Upload linux/amd64
         uses: actions/upload-artifact@v4
         with:
-          name: secure-input-${{ github.ref_name }}
-          path: dist/*
+          name: secure-input-${{ github.ref_name }}-linux-amd64
+          path: dist/*_linux_amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload linux/arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-linux-arm64
+          path: dist/*_linux_arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload darwin/amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-darwin-amd64
+          path: dist/*_darwin_amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload darwin/arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-darwin-arm64
+          path: dist/*_darwin_arm64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload windows/amd64
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-windows-amd64
+          path: dist/*_windows_amd64.zip
+          if-no-files-found: error
+
+      - name: Upload windows/arm64
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-windows-arm64
+          path: dist/*_windows_arm64.zip
+          if-no-files-found: error
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: secure-input-${{ github.ref_name }}-checksums
+          path: dist/checksums.txt
           if-no-files-found: error
