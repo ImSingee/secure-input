@@ -1,0 +1,11 @@
+# Only go.mod and *.go are copied into the build; keep everything else out of
+# the build context.
+.git
+.github
+dist
+*.test
+*_test.go
+.env
+.env.*
+Dockerfile
+.dockerignore
