@@ -23,6 +23,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: stable
+          cache: false # no dependencies, nothing to cache
 
       - name: Test
         run: go test ./...
