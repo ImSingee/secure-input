@@ -3,3 +3,5 @@ secure-input
 .env
 .env.*
 !.env.example
+
+*.secure-input-key.json

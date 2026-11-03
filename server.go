@@ -34,6 +34,8 @@ func newServer(store *Store) *server {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -136,9 +138,10 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	req := s.store.Create(spec)
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"id":        req.ID,
-		"url":       fmt.Sprintf("%s/r/%s", requestOrigin(r), req.ID),
-		"expiresAt": req.ExpiresAt.UTC().Format(time.RFC3339),
+		"id":         req.ID,
+		"url":        fmt.Sprintf("%s/r/%s", requestOrigin(r), req.ID),
+		"expiresAt":  req.ExpiresAt.UTC().Format(time.RFC3339),
+		"encryption": req.Encryption,
 	})
 }
 
@@ -170,14 +173,44 @@ func (s *server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Entries []submittedEntry `json:"entries"`
+		Entries   json.RawMessage   `json:"entries"`
+		Encrypted *EncryptedPayload `json:"encrypted"`
 	}
-	limited := http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	limit := int64(maxBodyBytes)
+	if req.Encryption != nil {
+		limit = maxEncryptedBodyBytes
+	}
+	limited := http.MaxBytesReader(w, r.Body, limit)
 	if err := json.NewDecoder(limited).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid JSON body: "+err.Error())
 		return
 	}
-	entries, err := validateEntries(req.Variables, body.Entries)
+	if req.Encryption != nil {
+		if body.Entries != nil {
+			writeError(w, http.StatusBadRequest, "Plaintext entries are not accepted for an encrypted request.")
+			return
+		}
+		if err := validateEncryptedPayload(body.Encrypted); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if s.store.SubmitEncrypted(req.ID, body.Encrypted) == nil {
+			writeError(w, http.StatusGone, "Request expired or was already answered.")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if body.Encrypted != nil {
+		writeError(w, http.StatusBadRequest, "Encrypted payload is not accepted for a plaintext request.")
+		return
+	}
+	var submitted []submittedEntry
+	if err := json.Unmarshal(body.Entries, &submitted); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid entries.")
+		return
+	}
+	entries, err := validateEntries(req.Variables, submitted)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -227,9 +260,8 @@ func (s *server) handleResult(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusGone, "Request expired or unknown.")
 			return
 		case req.Status == StatusSubmitted:
-			writeJSON(w, http.StatusOK, map[string]any{
-				"status":  req.Status,
-				"entries": req.Entries,
+			writeJSON(w, http.StatusOK, resultResponse{
+				Status: req.Status, Entries: req.Entries, Encrypted: req.Encrypted,
 			})
 			return
 		case req.Status == StatusDeclined:

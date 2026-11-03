@@ -55,13 +55,15 @@ type Entry struct {
 }
 
 type Request struct {
-	ID        string         `json:"id"`
-	Reason    string         `json:"reason"`
-	Variables []VariableSpec `json:"-"`
-	CreatedAt time.Time      `json:"-"`
-	ExpiresAt time.Time      `json:"expiresAt"`
-	Status    string         `json:"status"`
-	Entries   []Entry        `json:"entries,omitempty"`
+	ID         string            `json:"id"`
+	Reason     string            `json:"reason"`
+	Variables  []VariableSpec    `json:"-"`
+	CreatedAt  time.Time         `json:"-"`
+	ExpiresAt  time.Time         `json:"expiresAt"`
+	Status     string            `json:"status"`
+	Entries    []Entry           `json:"entries,omitempty"`
+	Encryption *EncryptionConfig `json:"encryption,omitempty"`
+	Encrypted  *EncryptedPayload `json:"encrypted,omitempty"`
 }
 
 func newID() string {
@@ -106,8 +108,9 @@ func validateEnvKey(key string) error {
 
 // Spec is the JSON body accepted by POST /api/requests and --spec.
 type Spec struct {
-	Reason    string         `json:"reason"`
-	Variables []VariableSpec `json:"variables"`
+	Reason     string            `json:"reason"`
+	Variables  []VariableSpec    `json:"variables"`
+	Encryption *EncryptionConfig `json:"encryption,omitempty"`
 }
 
 func validateSpec(spec *Spec) error {
@@ -119,6 +122,9 @@ func validateSpec(spec *Spec) error {
 	}
 	if len(spec.Variables) == 0 || len(spec.Variables) > MaxVariables {
 		return fmt.Errorf("variables must contain 1-%d items", MaxVariables)
+	}
+	if err := validateEncryption(spec.Encryption); err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	for i := range spec.Variables {
@@ -196,24 +202,27 @@ func NewStore(ttl time.Duration) *Store {
 func (s *Store) Create(spec Spec) *Request {
 	now := time.Now()
 	r := &Request{
-		ID:        newID(),
-		Reason:    spec.Reason,
-		Variables: spec.Variables,
-		CreatedAt: now,
-		ExpiresAt: now.Add(s.ttl),
-		Status:    StatusPending,
+		ID:         newID(),
+		Reason:     spec.Reason,
+		Variables:  append([]VariableSpec(nil), spec.Variables...),
+		Encryption: spec.Encryption,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(s.ttl),
+		Status:     StatusPending,
 	}
 	s.mu.Lock()
+	r = cloneRequest(r)
 	s.requests[r.ID] = r
+	snapshot := cloneRequest(r)
 	s.mu.Unlock()
-	return r
+	return snapshot
 }
 
-// Get returns the live request, or nil if missing/expired.
+// Get returns a snapshot of the live request, or nil if missing/expired.
 func (s *Store) Get(id string) *Request {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.getLocked(id)
+	return cloneRequest(s.getLocked(id))
 }
 
 func (s *Store) getLocked(id string) *Request {
@@ -234,13 +243,31 @@ func (s *Store) Submit(id string, entries []Entry) *Request {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := s.getLocked(id)
-	if r == nil || r.Status != StatusPending {
+	if r == nil || r.Status != StatusPending || r.Encryption != nil {
 		return nil
 	}
 	r.Status = StatusSubmitted
-	r.Entries = entries
+	r.Entries = append([]Entry(nil), entries...)
 	r.ExpiresAt = time.Now().Add(s.ttl)
-	return r
+	return cloneRequest(r)
+}
+
+// SubmitEncrypted stores only the opaque envelope for encrypted requests.
+func (s *Store) SubmitEncrypted(id string, payload *EncryptedPayload) *Request {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := s.getLocked(id)
+	if r == nil || r.Status != StatusPending || r.Encryption == nil {
+		return nil
+	}
+	if err := validateEncryptedPayload(payload); err != nil {
+		return nil
+	}
+	r.Status = StatusSubmitted
+	copy := *payload
+	r.Encrypted = &copy
+	r.ExpiresAt = time.Now().Add(s.ttl)
+	return cloneRequest(r)
 }
 
 func (s *Store) Decline(id string) *Request {
@@ -252,7 +279,7 @@ func (s *Store) Decline(id string) *Request {
 	}
 	r.Status = StatusDeclined
 	r.ExpiresAt = time.Now().Add(s.ttl)
-	return r
+	return cloneRequest(r)
 }
 
 // Consume returns the request. Pending requests stay; terminal requests
@@ -267,7 +294,7 @@ func (s *Store) Consume(id string) *Request {
 	if r.Status != StatusPending {
 		delete(s.requests, id)
 	}
-	return r
+	return cloneRequest(r)
 }
 
 func (s *Store) Sweep() int {
@@ -287,4 +314,24 @@ func (s *Store) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.requests)
+}
+
+// All exported store operations return independent snapshots. HTTP handlers
+// render/encode after releasing the mutex while other requests can mutate state.
+func cloneRequest(r *Request) *Request {
+	if r == nil {
+		return nil
+	}
+	copy := *r
+	copy.Variables = append([]VariableSpec(nil), r.Variables...)
+	copy.Entries = append([]Entry(nil), r.Entries...)
+	if r.Encryption != nil {
+		config := *r.Encryption
+		copy.Encryption = &config
+	}
+	if r.Encrypted != nil {
+		payload := *r.Encrypted
+		copy.Encrypted = &payload
+	}
+	return &copy
 }
