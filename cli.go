@@ -162,7 +162,8 @@ func createRequest(ctx context.Context, server string, spec *Spec) (*createRespo
 		}
 		// The fragment is not sent in HTTP requests. Honest browser code checks
 		// it against the server-supplied key to catch accidental substitution.
-		link.Fragment = url.Values{"e2ee": {spec.Encryption.PublicKey}}.Encode()
+		link.Fragment = "e2ee=" + spec.Encryption.PublicKey
+		link.RawFragment = url.Values{"e2ee": {spec.Encryption.PublicKey}}.Encode()
 		out.URL = link.String()
 	}
 	return &out, nil

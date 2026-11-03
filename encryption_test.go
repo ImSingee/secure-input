@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -151,6 +152,16 @@ func TestEncryptedServerLifecycle(t *testing.T) {
 	}
 	if !strings.Contains(created.URL, "#e2ee=") {
 		t.Fatal("missing pinned public key")
+	}
+	link, err := url.Parse(created.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// location.hash preserves percent escapes. Parse exactly once, as the
+	// browser's URLSearchParams does; Go must not double-encode %2B/%3D.
+	pin, err := url.ParseQuery(link.EscapedFragment())
+	if err != nil || pin.Get("e2ee") != spec.Encryption.PublicKey {
+		t.Fatalf("public-key fragment failed to round-trip: %q", created.URL)
 	}
 	res, err := http.Get(created.URL)
 	if err != nil {
