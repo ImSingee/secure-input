@@ -1,8 +1,16 @@
 package main
 
-import "html/template"
+import (
+	_ "embed"
+	"html/template"
+)
 
-var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
+//go:embed web/crypto.js
+var encryptionJS string
+
+var pageTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
+	"encryptionScript": func() template.JS { return template.JS(encryptionJS) },
+}).Parse(`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -70,6 +78,9 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   <p class="note">An AI agent asked for these values. Everything you enter is saved to a file on the
   agent&rsquo;s machine. Uncheck &ldquo;Keep private&rdquo; only for non-sensitive values &mdash; those
   are sent back to the AI in plaintext.</p>
+  {{if .Encryption}}<p class="note">End-to-end encryption is enabled. Values are encrypted in this browser before upload.
+  You must still trust the site serving this page and the CLI receiving them.</p>
+  {{else}}<p class="note summary warn">Encryption is disabled for this request. The server can read all submitted values.</p>{{end}}
   <form id="env-form">
     {{- range $i, $v := .Variables }}
     <div class="field">
@@ -97,10 +108,37 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   </form>
 </div>
 <script>
+{{encryptionScript}}
 (function () {
+  var encryption = {{.Encryption}};
+  var requestID = {{.ID}};
+  var encryptionReady;
+  var busy = false;
+  var finished = false;
+  var ready = false;
   var inputs = document.querySelectorAll('input[data-key]');
   var summary = document.getElementById('summary');
   var error = document.getElementById('error');
+
+  // Check the CLI-pinned key and browser capability before accepting input.
+  encryptionReady = (async function () {
+    checkEncryption(encryption, location.hash);
+    if (encryption) {
+      var recipient = await crypto.subtle.importKey('raw', decodePublicKey(encryption.publicKey), 'X25519', false, []);
+      var probe = await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
+      await crypto.subtle.deriveBits({ name: 'X25519', public: recipient }, probe.privateKey, 256);
+    }
+  })();
+  inputs.forEach(function (input) { input.disabled = true; });
+  document.getElementById('submit').disabled = true;
+  encryptionReady.then(function () {
+    inputs.forEach(function (input) { input.disabled = false; });
+    ready = true;
+    if (!busy && !finished) document.getElementById('submit').disabled = false;
+  }).catch(function () {
+    error.hidden = false;
+    error.textContent = 'Encryption could not be initialized. Check the original CLI link and use HTTPS (or localhost) with a browser supporting X25519. No values have been sent.';
+  });
 
   function updateSummary() {
     var shared = 0;
@@ -128,55 +166,69 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
   });
   updateSummary();
 
+  function setBusy(value) {
+    busy = value;
+    document.getElementById('submit').disabled = value || !ready;
+    document.getElementById('decline').disabled = value;
+  }
+
   function finish(ok, message) {
+    finished = true;
     document.querySelector('main').innerHTML =
       '<div class="card"><div class="done"><p>' +
       (ok ? 'Saved.' : 'Something went wrong.') + '</p><p class="muted">' +
       message + '</p></div></div>';
   }
 
-  document.getElementById('env-form').addEventListener('submit', function (event) {
+  document.getElementById('env-form').addEventListener('submit', async function (event) {
     event.preventDefault();
-    var entries = [];
-    inputs.forEach(function (input, i) {
-      entries.push({
-        key: input.getAttribute('data-key'),
-        value: input.value,
-        private: document.querySelector('input[data-private="' + input.getAttribute('data-key') + '"]').checked
-      });
-    });
     var submit = document.getElementById('submit');
-    submit.disabled = true;
-    fetch(location.pathname + '/submit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entries: entries })
-    }).then(function (res) {
-      if (res.ok) {
-        finish(true, 'The agent has been notified. You can close this tab.');
-      } else {
-        res.json().then(function (body) {
-          error.hidden = false;
-          error.textContent = body.error || 'Request expired or already submitted.';
-          submit.disabled = false;
-        }).catch(function () {
-          error.hidden = false;
-          error.textContent = 'Request expired or already submitted.';
-          submit.disabled = false;
+    if (submit.disabled || busy || finished) return;
+    setBusy(true);
+    error.hidden = true;
+    try {
+      await encryptionReady;
+      var entries = [];
+      inputs.forEach(function (input) {
+        if (new TextEncoder().encode(input.value).length > 64 * 1024) throw new Error('A value exceeds 65536 bytes.');
+        entries.push({
+          key: input.getAttribute('data-key'),
+          value: input.value,
+          private: document.querySelector('input[data-private="' + input.getAttribute('data-key') + '"]').checked
         });
-      }
-    }).catch(function () {
+      });
+      var payload = encryption
+        ? { encrypted: await encryptSubmission(entries, encryption, requestID) }
+        : { entries: entries };
+      var res = await fetch(location.pathname + '/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) throw new Error('Request expired, already submitted, or rejected.');
+      inputs.forEach(function (input) { input.value = ''; });
+      finish(true, 'The agent has been notified. You can close this tab.');
+    } catch (err) {
       error.hidden = false;
-      error.textContent = 'Network error. Your values are still here, try again.';
-      submit.disabled = false;
-    });
+      error.textContent = 'Submission failed. No plaintext fallback was attempted. Your values are still here; try again. ' + err.message;
+      setBusy(false);
+    }
   });
 
-  document.getElementById('decline').addEventListener('click', function () {
+  document.getElementById('decline').addEventListener('click', async function () {
+    if (busy || finished) return;
     if (!confirm('Decline this request? The agent will be notified and get no values.')) return;
-    fetch(location.pathname + '/decline', { method: 'POST' }).then(function () {
+    setBusy(true);
+    error.hidden = true;
+    try {
+      var res = await fetch(location.pathname + '/decline', { method: 'POST' });
+      if (!res.ok) throw new Error('The request may have expired or already been answered.');
       finish(true, 'Request declined. You can close this tab.');
-    });
+    } catch (err) {
+      error.hidden = false;
+      error.textContent = 'Could not decline the request. ' + err.message;
+      setBusy(false);
+    }
   });
 })();
 </script>
@@ -191,20 +243,24 @@ var pageTemplate = template.Must(template.New("page").Parse(`<!doctype html>
 </html>`))
 
 type pageData struct {
-	Title     string
-	Form      bool
-	Reason    string
-	Variables []VariableSpec
-	Message   string
-	Muted     string
+	Title      string
+	ID         string
+	Encryption *EncryptionConfig
+	Form       bool
+	Reason     string
+	Variables  []VariableSpec
+	Message    string
+	Muted      string
 }
 
 func renderFormPage(r *Request) pageData {
 	return pageData{
-		Title:     "Environment variables requested",
-		Form:      true,
-		Reason:    r.Reason,
-		Variables: r.Variables,
+		Title:      "Environment variables requested",
+		Form:       true,
+		ID:         r.ID,
+		Encryption: r.Encryption,
+		Reason:     r.Reason,
+		Variables:  r.Variables,
 	}
 }
 

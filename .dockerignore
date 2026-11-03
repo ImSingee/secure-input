@@ -1,5 +1,5 @@
-# Only go.mod and *.go are copied into the build; keep everything else out of
-# the build context.
+# Only go.mod, *.go, and web/crypto.js are needed by the build.
+# Never send local secrets or test tooling to a builder.
 .git
 .github
 dist
@@ -9,3 +9,8 @@ dist
 .env.*
 Dockerfile
 .dockerignore
+
+*.secure-input-key.json
+
+web/*_test.cjs
+node_modules

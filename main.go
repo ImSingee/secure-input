@@ -14,14 +14,21 @@ Usage:
 
   secure-input request --server URL --out PATH --reason TEXT
                        [--var KEY[:DESCRIPTION]]... [--public KEY]...
-                       [--spec JSON|@FILE] [--no-wait]
+                       [--spec JSON|@FILE] [--no-wait] [--key-file PATH]
+                       [--no-encryption]
       Create a request on the server, print the fill-in URL, wait for the
       user, then write the submitted values to PATH in .env format.
       Values marked private (the default) are masked in the output.
+      End-to-end encryption is enabled unless --no-encryption is set.
+      --no-wait saves a private key file for pull (0600 on Unix; default:
+      PATH.secure-input-key.json). Never share or commit this file.
+      On Windows, use a directory with an owner-only ACL.
 
   secure-input pull --server URL --id ID --out PATH [--wait SECONDS]
+                    [--key-file PATH] [--no-encryption]
       Fetch the result of an existing request once. Results are deleted
-      from the server on first pull.
+      from the server on first pull. The private key file is removed after
+      a successful save. Use --no-encryption only for plaintext requests.
 
 Exit codes: 0 submitted, 2 declined, 3 request expired or unknown,
 1 usage/network/server error.

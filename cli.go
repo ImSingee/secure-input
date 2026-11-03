@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -96,14 +99,21 @@ func buildSpec(reason string, varFlags, publicFlags stringList, specRaw string) 
 }
 
 type createResponse struct {
-	ID        string `json:"id"`
-	URL       string `json:"url"`
-	ExpiresAt string `json:"expiresAt"`
+	ID         string            `json:"id"`
+	URL        string            `json:"url"`
+	ExpiresAt  string            `json:"expiresAt"`
+	Encryption *EncryptionConfig `json:"encryption,omitempty"`
 }
 
+// Plaintext JSON can expand sixfold when Go escapes <, >, &, or controls.
+// Allow that expansion plus normalized/missing entries; encrypted envelopes
+// are smaller. Keep an explicit bound even for an untrusted relay.
+const maxResultBodyBytes = 6*maxBodyBytes + MaxVariables*256 + 1024
+
 type resultResponse struct {
-	Status  string  `json:"status"`
-	Entries []Entry `json:"entries"`
+	Status    string            `json:"status"`
+	Entries   []Entry           `json:"entries,omitempty"`
+	Encrypted *EncryptedPayload `json:"encrypted,omitempty"`
 }
 
 func apiURL(server, path string) (string, error) {
@@ -141,8 +151,25 @@ func createRequest(ctx context.Context, server string, spec *Spec) (*createRespo
 		return nil, fmt.Errorf("create request: server returned %s: %s", res.Status, readErrorBody(res.Body))
 	}
 	var out createResponse
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxEncryptedBodyBytes+1)).Decode(&out); err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
+	}
+	if spec.Encryption != nil && (out.Encryption == nil || *out.Encryption != *spec.Encryption) {
+		return nil, fmt.Errorf("server did not confirm the requested encryption; refusing to downgrade (upgrade the server or explicitly use --no-encryption)")
+	}
+	if out.ID == "" || strings.ContainsAny(out.ID, "/?#\\\x00") {
+		return nil, fmt.Errorf("server returned an invalid request id")
+	}
+	if spec.Encryption != nil {
+		link, err := url.Parse(out.URL)
+		if err != nil || link.Host == "" || (link.Scheme != "https" && link.Scheme != "http") {
+			return nil, fmt.Errorf("server returned an invalid form URL")
+		}
+		// The fragment is not sent in HTTP requests. Honest browser code checks
+		// it against the server-supplied key to catch accidental substitution.
+		link.Fragment = "e2ee=" + spec.Encryption.PublicKey
+		link.RawFragment = url.Values{"e2ee": {spec.Encryption.PublicKey}}.Encode()
+		out.URL = link.String()
 	}
 	return &out, nil
 }
@@ -180,7 +207,7 @@ func pollOnce(ctx context.Context, server, id string, waitSecs int) (*resultResp
 		return nil, false, fmt.Errorf("poll: server returned %s: %s", res.Status, readErrorBody(res.Body))
 	}
 	var out resultResponse
-	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxResultBodyBytes+1)).Decode(&out); err != nil {
 		return nil, false, fmt.Errorf("poll: %w", err)
 	}
 	return &out, false, nil
@@ -238,6 +265,8 @@ func cmdRequest(args []string) error {
 	fs.Var(&publicFlags, "public", "mark a variable as shareable with the AI (repeatable; default is private)")
 	specRaw := fs.String("spec", "", "full request spec as JSON, or @file.json (overrides --reason/--var/--public)")
 	noWait := fs.Bool("no-wait", false, "print the URL and request id, then exit without waiting")
+	noEncryption := fs.Bool("no-encryption", false, "disable end-to-end encryption (server can read values)")
+	keyFile := fs.String("key-file", "", "save private request state for a later pull (default with --no-wait: OUT.secure-input-key.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -248,12 +277,45 @@ func cmdRequest(args []string) error {
 	if err != nil {
 		return fail(1, "%v", err)
 	}
+	var privateKey *ecdh.PrivateKey
+	// A JSON spec cannot turn off the CLI's default encryption or supply a key
+	// for which this process does not possess the private half.
+	spec.Encryption = nil
+	if *noEncryption {
+		if *keyFile != "" {
+			return fail(1, "--key-file cannot be used with --no-encryption")
+		}
+		fmt.Fprintln(os.Stderr, "warning: end-to-end encryption is disabled; the server can read submitted values")
+	} else {
+		privateKey, err = ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return fail(1, "generate encryption key: %v", err)
+		}
+		spec.Encryption = &EncryptionConfig{Version: encryptionVersion, PublicKey: base64.StdEncoding.EncodeToString(privateKey.PublicKey().Bytes())}
+		if *noWait && *keyFile == "" {
+			*keyFile = *out + ".secure-input-key.json"
+		}
+		if *keyFile != "" {
+			if samePath(*keyFile, *out) {
+				return fail(1, "--key-file must differ from --out")
+			}
+			if _, err := os.Lstat(*keyFile); !os.IsNotExist(err) {
+				return fail(1, "--key-file must be a new file")
+			}
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	created, err := createRequest(ctx, *server, spec)
 	if err != nil {
 		return fail(1, "%v", err)
+	}
+	if *keyFile != "" {
+		if err := saveRequestKey(*keyFile, *server, created.ID, spec, privateKey); err != nil {
+			return fail(1, "%v", err)
+		}
+		fmt.Fprintln(os.Stderr, "private request key saved to:", *keyFile)
 	}
 	// The URL goes to stdout so the user can grab it; progress stays on stderr.
 	fmt.Println(created.URL)
@@ -266,12 +328,23 @@ func cmdRequest(args []string) error {
 
 	result, err := waitForResult(ctx, *server, created.ID)
 	if err != nil {
+		if ce, ok := err.(*cliError); ok && ce.code == 3 {
+			removeRequestKey(*keyFile)
+		}
 		return err
 	}
 	if result.Status == StatusDeclined {
+		removeRequestKey(*keyFile)
 		return fail(2, "the user declined the request")
 	}
-	return reportResult(*out, result)
+	if err := decodeResult(result, privateKey, created.ID, spec); err != nil {
+		return fail(1, "%v", err)
+	}
+	if err := reportResult(*out, result); err != nil {
+		return err
+	}
+	removeRequestKey(*keyFile)
+	return nil
 }
 
 func cmdPull(args []string) error {
@@ -280,11 +353,33 @@ func cmdPull(args []string) error {
 	id := fs.String("id", "", "request id returned by `request --no-wait` (required)")
 	out := fs.String("out", "", "path to write the .env file to (required)")
 	wait := fs.Int("wait", 60, "seconds to wait for the user to submit")
+	noEncryption := fs.Bool("no-encryption", false, "pull a plaintext request (encryption is required by default)")
+	keyFile := fs.String("key-file", "", "private request state (default: OUT.secure-input-key.json)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *id == "" || *out == "" {
 		return fail(1, "--id and --out are required")
+	}
+	var privateKey *ecdh.PrivateKey
+	var spec *Spec
+	if *noEncryption {
+		if *keyFile != "" {
+			return fail(1, "--key-file cannot be used with --no-encryption")
+		}
+		fmt.Fprintln(os.Stderr, "warning: pulling without end-to-end encryption")
+	} else {
+		if *keyFile == "" {
+			*keyFile = *out + ".secure-input-key.json"
+		}
+		if samePath(*keyFile, *out) {
+			return fail(1, "--key-file must differ from --out")
+		}
+		var err error
+		privateKey, spec, err = loadRequestKey(*keyFile, *server, *id)
+		if err != nil {
+			return fail(1, "%v", err)
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -293,15 +388,24 @@ func cmdPull(args []string) error {
 		return fail(1, "%v", err)
 	}
 	if gone {
+		removeRequestKey(*keyFile)
 		return fail(3, "request expired or already consumed")
 	}
 	switch result.Status {
 	case StatusPending:
 		return fail(3, "request is still pending after %ds", *wait)
 	case StatusDeclined:
+		removeRequestKey(*keyFile)
 		return fail(2, "the user declined the request")
 	}
-	return reportResult(*out, result)
+	if err := decodeResult(result, privateKey, *id, spec); err != nil {
+		return fail(1, "%v", err)
+	}
+	if err := reportResult(*out, result); err != nil {
+		return err
+	}
+	removeRequestKey(*keyFile)
+	return nil
 }
 
 // waitForResult long-polls until the request resolves. Transient network
