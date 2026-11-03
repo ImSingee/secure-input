@@ -416,3 +416,44 @@ func TestEncryptedStoreSnapshots(t *testing.T) {
 		t.Fatal("Get returned mutable store state")
 	}
 }
+
+func TestPlaintextResultAllowsJSONExpansion(t *testing.T) {
+	srv, _ := newTestServer(t)
+	spec := specForTest()
+	spec.Variables = []VariableSpec{{Key: "ONE", Private: true}, {Key: "TWO", Private: true}, {Key: "THREE", Private: true}, {Key: "OMITTED", Private: true}}
+	created, err := createRequest(context.Background(), srv.URL, &spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Browser JSON.stringify sends these characters literally. Go's JSON
+	// response escapes them, increasing the result to over 1 MiB.
+	var entries []string
+	values := []string{strings.Repeat("<", MaxValueLength), strings.Repeat(">", MaxValueLength), strings.Repeat("&", MaxValueLength)}
+	for i, value := range values {
+		entries = append(entries, `{"key":"`+spec.Variables[i].Key+`","value":"`+value+`"}`)
+	}
+	body := `{"entries":[` + strings.Join(entries, ",") + `]}`
+	if len(body) >= maxBodyBytes {
+		t.Fatal("fixture exceeds valid submission limit")
+	}
+	res := postJSON(t, srv.URL+"/r/"+created.ID+"/submit", body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("submit: %s", res.Status)
+	}
+	result, gone, err := pollOnce(context.Background(), srv.URL, created.ID, 0)
+	if err != nil || gone {
+		t.Fatalf("escaped plaintext result: gone=%v, err=%v", gone, err)
+	}
+	if len(result.Entries) != 4 {
+		t.Fatalf("entries: %d", len(result.Entries))
+	}
+	for i, value := range values {
+		if result.Entries[i].Value != value || !result.Entries[i].Private {
+			t.Fatal("plaintext result was corrupted")
+		}
+	}
+	if result.Entries[3].Value != "" {
+		t.Fatal("missing entry was not normalized")
+	}
+}

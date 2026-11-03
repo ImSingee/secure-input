@@ -105,6 +105,11 @@ type createResponse struct {
 	Encryption *EncryptionConfig `json:"encryption,omitempty"`
 }
 
+// Plaintext JSON can expand sixfold when Go escapes <, >, &, or controls.
+// Allow that expansion plus normalized/missing entries; encrypted envelopes
+// are smaller. Keep an explicit bound even for an untrusted relay.
+const maxResultBodyBytes = 6*maxBodyBytes + MaxVariables*256 + 1024
+
 type resultResponse struct {
 	Status    string            `json:"status"`
 	Entries   []Entry           `json:"entries,omitempty"`
@@ -202,7 +207,7 @@ func pollOnce(ctx context.Context, server, id string, waitSecs int) (*resultResp
 		return nil, false, fmt.Errorf("poll: server returned %s: %s", res.Status, readErrorBody(res.Body))
 	}
 	var out resultResponse
-	if err := json.NewDecoder(io.LimitReader(res.Body, maxEncryptedBodyBytes+1)).Decode(&out); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, maxResultBodyBytes+1)).Decode(&out); err != nil {
 		return nil, false, fmt.Errorf("poll: %w", err)
 	}
 	return &out, false, nil
