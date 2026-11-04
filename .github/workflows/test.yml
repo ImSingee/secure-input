@@ -35,3 +35,4 @@ jobs:
         run: |
           go build -o secure-input .
           node web/browser_test.cjs
+          node web/file_browser_test.cjs

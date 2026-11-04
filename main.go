@@ -5,12 +5,12 @@ import (
 	"os"
 )
 
-const usage = `secure-input — request environment values from a human without
-sending them through the AI context.
+const usage = `secure-input — request environment values from a human, or share
+a file with them, without sending private data through the AI context.
 
 Usage:
   secure-input serve [--addr :8787]
-      Run the server that hosts fill-in forms and stores results in memory.
+      Run the server that hosts fill-in forms and shared files in memory.
 
   secure-input request --server URL --out PATH --reason TEXT
                        [--var KEY[:DESCRIPTION]]... [--public KEY]...
@@ -30,6 +30,13 @@ Usage:
       from the server on first pull. The private key file is removed after
       a successful save. Use --no-encryption only for plaintext requests.
 
+  secure-input share --server URL --file PATH [--name NAME] [--message TEXT]
+                     [--no-encryption]
+      Upload a local file (at most 512 KiB) and print a link that shows it to
+      the user. The file stays only in server memory, for at most 30 minutes;
+      the user can delete it sooner. End-to-end encryption is enabled unless
+      --no-encryption is set: the key is only in the link's #fragment.
+
 Exit codes: 0 submitted, 2 declined, 3 request expired or unknown,
 1 usage/network/server error.
 `
@@ -47,6 +54,8 @@ func main() {
 		err = cmdRequest(os.Args[2:])
 	case "pull":
 		err = cmdPull(os.Args[2:])
+	case "share":
+		err = cmdShare(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

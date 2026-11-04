@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"html/template"
+	"time"
 )
 
 //go:embed web/crypto.js
@@ -68,9 +69,25 @@ var pageTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
   .done .muted { color: #78716c; font-size: 12px; }
   .error { color: #b91c1c; font-size: 12px; margin-top: 8px; }
   footer { font-size: 11px; color: #a8a29e; text-align: center; margin-top: 16px; }
+  main.wide { max-width: 880px; }
+  .file-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; font-weight: 600; margin: 0 0 2px; word-break: break-all; }
+  #message { margin-bottom: 12px; }
+  .countdown { font-size: 13px; font-weight: 600; color: #44403c; margin: 0 0 12px; font-variant-numeric: tabular-nums; }
+  .countdown.warn { color: #c2410c; }
+  .countdown.gone { color: #78716c; font-weight: 400; }
+  .preview { margin: 0 0 16px; }
+  .preview pre {
+    margin: 0; padding: 12px; max-height: 65vh; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word;
+    background: #fafaf9; border: 1px solid #e7e5e4; border-radius: 8px;
+  }
+  .preview img { display: block; max-width: 100%; max-height: 70vh; margin: 0 auto; border-radius: 8px; }
+  .preview .empty { font-size: 12px; color: #78716c; margin: 0; }
+  button:disabled { opacity: 0.5; cursor: default; }
 </style>
 </head>
-<body><main>
+<body><main{{if .File}} class="wide"{{end}}>
 {{- if .Form }}
 <h1>Environment variables requested</h1>
 <div class="card">
@@ -232,25 +249,210 @@ var pageTemplate = template.Must(template.New("page").Funcs(template.FuncMap{
   });
 })();
 </script>
+{{- else if .File }}
+<h1>File shared by an AI agent</h1>
+<div class="card">
+  <p class="reason" id="message" hidden></p>
+  <p class="file-name" id="file-name">Loading&hellip;</p>
+  <p class="note" id="file-detail">{{.FileSize}} bytes</p>
+  <p class="countdown" id="countdown" role="timer" aria-live="off"></p>
+  {{if .FileEncrypted}}<p class="note">End-to-end encryption is enabled. This browser decrypts the file with the key in the link;
+  the server stores only ciphertext. You must still trust the site serving this page.</p>
+  {{else}}<p class="note summary warn">Encryption is disabled for this file. The server can read its name and contents.</p>{{end}}
+  <div class="preview" id="preview" hidden></div>
+  <div class="actions">
+    <button type="button" class="decline" id="delete">Delete from server</button>
+    <button type="button" class="ghost" id="copy" hidden>Copy text</button>
+    <button type="button" class="primary" id="download" disabled>Download</button>
+  </div>
+  <p class="error" id="error" hidden></p>
+</div>
+<script>
+{{encryptionScript}}
+(function () {
+  var fileID = {{.ID}};
+  var encrypted = {{.FileEncrypted}};
+  var remaining = {{.RemainingSeconds}};
+  var loadedAt = performance.now();
+  var apiURL = new URL('../api/files/' + encodeURIComponent(fileID), location.href).href;
+  var imageTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp'];
+  var countdown = document.getElementById('countdown');
+  var preview = document.getElementById('preview');
+  var error = document.getElementById('error');
+  var deleteButton = document.getElementById('delete');
+  var copyButton = document.getElementById('copy');
+  var downloadButton = document.getElementById('download');
+  var file = null;
+  var text = null;
+  var timer;
+
+  function showError(message) {
+    error.hidden = false;
+    error.textContent = message;
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' bytes';
+    return (bytes / 1024).toFixed(1) + ' KiB (' + bytes + ' bytes)';
+  }
+
+  // Counts from page load rather than the client clock, so clock skew does not matter.
+  function tick() {
+    var left = Math.max(0, Math.ceil(remaining - (performance.now() - loadedAt) / 1000));
+    if (left === 0) {
+      serverGone('Expired and removed from the server.');
+      return;
+    }
+    var minutes = Math.floor(left / 60);
+    var seconds = left % 60;
+    countdown.className = 'countdown' + (left <= 60 ? ' warn' : '');
+    countdown.textContent = 'Removed from the server automatically in ' +
+      minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+  }
+
+  function serverGone(message) {
+    clearInterval(timer);
+    countdown.className = 'countdown gone';
+    countdown.textContent = message + (file ? ' This tab keeps its copy until you close it.' : '');
+    deleteButton.disabled = true;
+  }
+
+  function decodeText(bytes) {
+    try {
+      var decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      return decoded.indexOf('\u0000') === -1 ? decoded : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function render(opened) {
+    file = opened;
+    var meta = file.meta;
+    document.getElementById('file-name').textContent = meta.name;
+    document.getElementById('file-detail').textContent = formatSize(file.content.length) + ' \u00b7 ' + meta.type;
+    document.title = meta.name + ' \u2013 shared file';
+    if (meta.message) {
+      var message = document.getElementById('message');
+      message.textContent = meta.message;
+      message.hidden = false;
+    }
+    var baseType = meta.type.split(';')[0].trim().toLowerCase();
+    preview.hidden = false;
+    if (file.content.length === 0) {
+      var empty = document.createElement('p');
+      empty.className = 'empty';
+      empty.textContent = 'This file is empty.';
+      preview.appendChild(empty);
+    } else if (imageTypes.indexOf(baseType) !== -1) {
+      var img = document.createElement('img');
+      img.alt = meta.name;
+      img.src = URL.createObjectURL(new Blob([file.content], { type: baseType }));
+      img.onerror = function () {
+        preview.textContent = '';
+        var failed = document.createElement('p');
+        failed.className = 'empty';
+        failed.textContent = 'This image cannot be displayed. Download it to open it.';
+        preview.appendChild(failed);
+      };
+      preview.appendChild(img);
+    } else if ((text = decodeText(file.content)) !== null) {
+      var pre = document.createElement('pre');
+      pre.textContent = text;
+      preview.appendChild(pre);
+      copyButton.hidden = false;
+    } else {
+      var none = document.createElement('p');
+      none.className = 'empty';
+      none.textContent = 'No preview for this file type. Download it to open it.';
+      preview.appendChild(none);
+    }
+    downloadButton.disabled = false;
+  }
+
+  timer = setInterval(tick, 1000);
+  tick();
+
+  (async function () {
+    var key = checkFileShare(encrypted, location.hash);
+    var res = await fetch(apiURL, { cache: 'no-store' });
+    if (res.status === 410) {
+      document.getElementById('file-name').textContent = 'File unavailable';
+      serverGone('This file has expired or was deleted from the server.');
+      return;
+    }
+    if (!res.ok) throw new Error('The server returned ' + res.status + '.');
+    render(await openSharedFile(await res.json(), key));
+  })().catch(function (err) {
+    document.getElementById('file-name').textContent = 'File could not be opened';
+    showError(err.message);
+  });
+
+  downloadButton.addEventListener('click', function () {
+    if (!file) return;
+    // octet-stream forces a download instead of rendering the file in this origin.
+    var url = URL.createObjectURL(new Blob([file.content], { type: 'application/octet-stream' }));
+    var link = document.createElement('a');
+    link.href = url;
+    link.download = file.meta.name;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+  });
+
+  copyButton.addEventListener('click', async function () {
+    try {
+      await navigator.clipboard.writeText(text);
+      copyButton.textContent = 'Copied';
+      setTimeout(function () { copyButton.textContent = 'Copy text'; }, 1500);
+    } catch (err) {
+      showError('Could not copy to the clipboard. Select the text and copy it manually.');
+    }
+  });
+
+  deleteButton.addEventListener('click', async function () {
+    if (deleteButton.disabled) return;
+    if (!confirm('Delete this file from the server now? The link will stop working.')) return;
+    deleteButton.disabled = true;
+    error.hidden = true;
+    try {
+      var res = await fetch(apiURL, { method: 'DELETE' });
+      if (res.status !== 204 && res.status !== 410) throw new Error('The server returned ' + res.status + '.');
+      serverGone('Deleted from the server.');
+    } catch (err) {
+      showError('Could not delete the file. ' + err.message);
+      deleteButton.disabled = false;
+    }
+  });
+})();
+</script>
 {{- else }}
 <div class="card"><div class="done">
   <p>{{.Message}}</p>
   {{- if .Muted }}<p class="muted">{{.Muted}}</p>{{- end }}
 </div></div>
 {{- end }}
-<footer>secure-input &middot; this link is single-use and expires 30 minutes after creation</footer>
+{{- if .Footer }}
+<footer>secure-input &middot; {{.Footer}}</footer>
+{{- end }}
 </main></body>
 </html>`))
 
 type pageData struct {
-	Title      string
-	ID         string
-	Encryption *EncryptionConfig
-	Form       bool
-	Reason     string
-	Variables  []VariableSpec
-	Message    string
-	Muted      string
+	Title            string
+	File             bool
+	FileEncrypted    bool
+	FileSize         int
+	RemainingSeconds int
+	Footer           string
+	ID               string
+	Encryption       *EncryptionConfig
+	Form             bool
+	Reason           string
+	Variables        []VariableSpec
+	Message          string
+	Muted            string
 }
 
 func renderFormPage(r *Request) pageData {
@@ -261,9 +463,27 @@ func renderFormPage(r *Request) pageData {
 		Encryption: r.Encryption,
 		Reason:     r.Reason,
 		Variables:  r.Variables,
+		Footer:     requestFooter,
 	}
 }
 
-func renderMessagePage(title, message, muted string) pageData {
-	return pageData{Title: title, Message: message, Muted: muted}
+const (
+	requestFooter = "this link is single-use and expires 30 minutes after creation"
+	fileFooter    = "shared files live only in server memory, for at most 30 minutes"
+)
+
+func renderMessagePage(title, message, muted, footer string) pageData {
+	return pageData{Title: title, Message: message, Muted: muted, Footer: footer}
+}
+
+func renderFilePage(f *SharedFile) pageData {
+	return pageData{
+		Title:            "Shared file",
+		File:             true,
+		ID:               f.ID,
+		FileEncrypted:    f.Upload.Encrypted != nil,
+		FileSize:         f.ContentSize,
+		RemainingSeconds: max(0, int(time.Until(f.ExpiresAt).Seconds())),
+		Footer:           fileFooter,
+	}
 }

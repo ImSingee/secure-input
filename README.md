@@ -5,6 +5,9 @@ an AI context. The CLI prints a single-use browser link, waits for submission,
 and writes a mode-0600 `.env` file. Values are masked in CLI output unless the
 person explicitly clears **Keep private**.
 
+The agent can also [share a local file](#sharing-a-file) with the person through
+a link, end-to-end encrypted by default.
+
 ## Usage
 
 ```sh
@@ -55,6 +58,47 @@ request, explicitly pass `--no-encryption`.
 Results still expire and are consumed on the first completed pull. As before,
 a lost result response or a failure writing the `.env` after consumption requires
 a new request. Preserving a private key alone cannot recover a consumed result.
+
+## Sharing a file
+
+```sh
+secure-input share --server https://your-server.example --file ./report.md \
+  --message 'The deployment report you asked for'
+```
+
+The CLI prints a link to stdout and exits. Opening it shows the file: text is
+previewed as plain text, PNG/JPEG/GIF/WebP/AVIF/BMP images are displayed, and any
+file can be downloaded. The page counts down to the server-side expiry and has a
+**Delete from server** button for removing the file as soon as it has been read.
+
+- Files are limited to **512 KiB** (checked by both CLI and server).
+- Files live **only in server memory**, for at most **30 minutes** from upload.
+  Viewing does not extend that time; nothing is written to disk. A server keeps
+  at most 256 MiB of shared files and refuses new uploads (503) beyond that.
+- A file can be viewed any number of times until it expires or is deleted.
+  Anyone with the full link can view it **and delete it**.
+- `--name` overrides the displayed file name; `--message` adds a note.
+- `--no-encryption` uploads the file in plaintext. The CLI and page warn that the
+  server can read it.
+
+### File encryption (v1)
+
+The CLI generates a random 256-bit key for each share and places it only in the
+URL fragment (`#key=`, unpadded base64url). Browsers do not send fragments to
+the server. Metadata (`{name, type, message}` as JSON) and content are encrypted
+separately with **AES-256-GCM**, each with a fresh random 12-byte nonce and a
+128-bit tag. The additional authenticated data is `secure-input/file/v1`, a NUL
+byte, then `meta` or `content`, so the two parts cannot be swapped. The upload is
+`{encrypted: {version, metaNonce, meta, contentNonce, content}}` with canonical
+padded standard base64; the server validates sizes and stores the envelope as is.
+
+The page decrypts with Web Crypto and refuses to show anything if the key is
+missing or malformed, decryption fails, or the server serves plaintext for a link
+that carries a key. File content is rendered only as text or as an image from a
+`blob:` URL, never as HTML; downloads use `application/octet-stream`. Pages send a
+restrictive Content Security Policy. The server still sees the file's size,
+timestamps, and access patterns. The [trust boundary](#trust-boundary) below
+applies here too: whoever serves the page's JavaScript could read the key.
 
 ## Encryption protocol (v1)
 
@@ -129,7 +173,9 @@ go build .
 The CI test workflow installs Node and requires the interoperability test. It
 also installs Playwright 1.62.1 and Chromium and runs `node web/browser_test.cjs`
 against the built CLI and a local test server, covering encryption, retry,
-key pinning, unavailable crypto, submit/decline races, and explicit plaintext. The
+key pinning, unavailable crypto, submit/decline races, and explicit plaintext.
+`node web/file_browser_test.cjs` covers file sharing: previews, copy, download,
+deletion, missing or wrong keys, countdown expiry, plaintext, and the size limit. The
 Go suite also covers authentication failure, request binding, downgrade refusal,
 malformed envelopes, server ciphertext-only storage, private-key file safety,
 and default-encrypted / explicitly-plaintext CLI flows.
