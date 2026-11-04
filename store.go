@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -193,10 +194,107 @@ type Store struct {
 	mu       sync.Mutex
 	ttl      time.Duration
 	requests map[string]*Request
+
+	files        map[string]*SharedFile
+	fileBytes    int
+	fileCapacity int
 }
 
 func NewStore(ttl time.Duration) *Store {
-	return &Store{ttl: ttl, requests: map[string]*Request{}}
+	return &Store{
+		ttl:          ttl,
+		requests:     map[string]*Request{},
+		files:        map[string]*SharedFile{},
+		fileCapacity: MaxStoredFileBytes,
+	}
+}
+
+// SharedFile is a file shared by an agent. It is never mutated after creation;
+// store methods still return copies so callers cannot alter stored state.
+type SharedFile struct {
+	ID        string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	Upload    fileUpload
+	// ContentSize is the file's byte length. Ciphertext reveals it anyway.
+	ContentSize int
+	size        int
+}
+
+var errFileStoreFull = errors.New("server file storage is full; try again later")
+
+// CreateFile stores a validated upload until the TTL ends or it is deleted.
+// Expiry is fixed at creation: viewing a file never extends its lifetime.
+func (s *Store) CreateFile(upload fileUpload) (*SharedFile, error) {
+	now := time.Now()
+	f := &SharedFile{ID: newID(), CreatedAt: now, ExpiresAt: now.Add(s.ttl), ContentSize: contentSize(&upload), size: uploadSize(&upload)}
+	if upload.File != nil {
+		plain := *upload.File
+		f.Upload.File = &plain
+	} else {
+		encrypted := *upload.Encrypted
+		f.Upload.Encrypted = &encrypted
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fileBytes+f.size > s.fileCapacity {
+		s.sweepLocked(now)
+		if s.fileBytes+f.size > s.fileCapacity {
+			return nil, errFileStoreFull
+		}
+	}
+	s.files[f.ID] = f
+	s.fileBytes += f.size
+	return cloneFile(f), nil
+}
+
+func (s *Store) GetFile(id string) *SharedFile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.files[id]
+	if !ok {
+		return nil
+	}
+	if !f.ExpiresAt.After(time.Now()) {
+		s.deleteFileLocked(id)
+		return nil
+	}
+	return cloneFile(f)
+}
+
+// DeleteFile removes a live file. It reports false if it was already gone.
+func (s *Store) DeleteFile(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, ok := s.files[id]
+	if !ok {
+		return false
+	}
+	s.deleteFileLocked(id)
+	return f.ExpiresAt.After(time.Now())
+}
+
+func (s *Store) deleteFileLocked(id string) bool {
+	f, ok := s.files[id]
+	if !ok {
+		return false
+	}
+	delete(s.files, id)
+	s.fileBytes -= f.size
+	return true
+}
+
+func cloneFile(f *SharedFile) *SharedFile {
+	copy := *f
+	if f.Upload.File != nil {
+		plain := *f.Upload.File
+		copy.Upload.File = &plain
+	}
+	if f.Upload.Encrypted != nil {
+		encrypted := *f.Upload.Encrypted
+		copy.Upload.Encrypted = &encrypted
+	}
+	return &copy
 }
 
 func (s *Store) Create(spec Spec) *Request {
@@ -300,10 +398,20 @@ func (s *Store) Consume(id string) *Request {
 func (s *Store) Sweep() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.sweepLocked(time.Now())
+}
+
+func (s *Store) sweepLocked(now time.Time) int {
 	removed := 0
 	for id, r := range s.requests {
-		if !r.ExpiresAt.After(time.Now()) {
+		if !r.ExpiresAt.After(now) {
 			delete(s.requests, id)
+			removed++
+		}
+	}
+	for id, f := range s.files {
+		if !f.ExpiresAt.After(now) {
+			s.deleteFileLocked(id)
 			removed++
 		}
 	}

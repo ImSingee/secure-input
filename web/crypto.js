@@ -48,3 +48,96 @@ async function encryptSubmission(entries, config, requestID) {
     plaintext.fill(0);
   }
 }
+
+// Shared files, version 1: AES-256-GCM with a random key from the URL fragment.
+function decodeBase64Bytes(value, size) {
+  if (typeof value !== 'string') throw new Error('Invalid base64 data.');
+  let raw;
+  try {
+    raw = atob(value);
+  } catch (err) {
+    throw new Error('Invalid base64 data.');
+  }
+  if (btoa(raw) !== value || (size !== undefined && raw.length !== size)) {
+    throw new Error('Invalid base64 data.');
+  }
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+function decodeFileKey(value) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(value)) throw new Error('The decryption key in this link is malformed. Ask the agent for the full link.');
+  try {
+    return decodeBase64Bytes(value.replace(/-/g, '+').replace(/_/g, '/') + '=', 32);
+  } catch (err) {
+    throw new Error('The decryption key in this link is malformed. Ask the agent for the full link.');
+  }
+}
+
+// Returns the raw key for an encrypted share, or null for an explicitly
+// unencrypted one. A key in the link for an "unencrypted" file means the server
+// changed the mode, so nothing is shown.
+function checkFileShare(encrypted, fragment) {
+  const value = new URLSearchParams(fragment.replace(/^#/, '')).get('key');
+  if (!encrypted) {
+    if (value !== null) throw new Error('This link carries a decryption key, but the server says the file is not encrypted. Refusing to show it.');
+    return null;
+  }
+  if (value === null) throw new Error('This link is missing its decryption key (the part after #). Ask the agent for the full link.');
+  if (!globalThis.isSecureContext || !globalThis.crypto || !crypto.subtle) {
+    throw new Error('Decryption requires HTTPS (or localhost) and a browser with Web Crypto support.');
+  }
+  return decodeFileKey(value);
+}
+
+function utf8Length(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+function checkFileMeta(meta) {
+  if (!meta || typeof meta !== 'object') throw new Error('Invalid file metadata.');
+  const { name, type } = meta;
+  const message = meta.message === undefined ? '' : meta.message;
+  if (typeof name !== 'string' || name === '' || utf8Length(name) > 255 || name === '.' || name === '..' || /[\/\\\u0000-\u001f\u007f-\u009f]/.test(name)) {
+    throw new Error('Invalid file name.');
+  }
+  if (typeof type !== 'string' || !/^[\x20-\x7e]{1,255}$/.test(type)) throw new Error('Invalid file type.');
+  if (typeof message !== 'string' || utf8Length(message) > 2000) throw new Error('Invalid file message.');
+  return { name, type, message };
+}
+
+// body is the GET /api/files/{id} response; key comes from checkFileShare.
+async function openSharedFile(body, key) {
+  if (!body || typeof body !== 'object') throw new Error('Invalid server response.');
+  if (key === null) {
+    if (!body.file || body.encrypted) throw new Error('Expected an unencrypted file from the server.');
+    return { meta: checkFileMeta(body.file), content: decodeBase64Bytes(body.file.content) };
+  }
+  const e = body.encrypted;
+  if (!e || body.file || e.version !== 1) throw new Error('Expected an encrypted file; refusing to show anything else.');
+  const parts = {
+    meta: [decodeBase64Bytes(e.metaNonce, 12), decodeBase64Bytes(e.meta)],
+    content: [decodeBase64Bytes(e.contentNonce, 12), decodeBase64Bytes(e.content)],
+  };
+  if (parts.meta[1].length > 16 * 1024 + 16 || parts.content[1].length > 512 * 1024 + 16) {
+    throw new Error('The encrypted file is too large.');
+  }
+  const aesKey = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['decrypt']);
+  const open = async part => {
+    try {
+      return new Uint8Array(await crypto.subtle.decrypt({
+        name: 'AES-GCM', iv: parts[part][0], tagLength: 128,
+        additionalData: new TextEncoder().encode('secure-input/file/v1\x00' + part),
+      }, aesKey, parts[part][1]));
+    } catch (err) {
+      throw new Error('The file could not be decrypted. The link may be incomplete, or the file was altered.');
+    }
+  };
+  let meta;
+  try {
+    meta = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await open('meta')));
+  } catch (err) {
+    if (err.message.startsWith('The file could not be decrypted')) throw err;
+    throw new Error('Invalid file metadata.');
+  }
+  return { meta: checkFileMeta(meta), content: await open('content') };
+}

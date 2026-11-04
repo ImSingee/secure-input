@@ -30,6 +30,10 @@ func newServer(store *Store) *server {
 	s.mux.HandleFunc("POST /r/{id}/submit", s.handleSubmit)
 	s.mux.HandleFunc("POST /r/{id}/decline", s.handleDecline)
 	s.mux.HandleFunc("GET /api/requests/{id}/result", s.handleResult)
+	s.mux.HandleFunc("POST /api/files", s.handleCreateFile)
+	s.mux.HandleFunc("GET /f/{id}", s.handleFilePage)
+	s.mux.HandleFunc("GET /api/files/{id}", s.handleGetFile)
+	s.mux.HandleFunc("DELETE /api/files/{id}", s.handleDeleteFile)
 	return s
 }
 
@@ -91,8 +95,14 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// pageCSP limits what a page can load or contact. Decrypted file previews are
+// shown only as text or blob: images; nothing is fetched from other origins.
+const pageCSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; " +
+	"img-src blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
 func writePage(w http.ResponseWriter, status int, data pageData) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", pageCSP)
 	w.WriteHeader(status)
 	if err := pageTemplate.Execute(w, data); err != nil {
 		log.Printf("render page: %v", err)
@@ -121,7 +131,8 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	writePage(w, http.StatusOK, renderMessagePage(
 		"secure-input",
 		"secure-input is running.",
-		"Environment value requests arrive here as single-use links.",
+		"Environment value requests and shared files arrive here as links.",
+		"",
 	))
 }
 
@@ -152,6 +163,7 @@ func (s *server) handleForm(w http.ResponseWriter, r *http.Request) {
 			"Request expired",
 			"This link has expired or was already used.",
 			"Ask the agent to run the request command again.",
+			requestFooter,
 		))
 		return
 	}
@@ -160,6 +172,7 @@ func (s *server) handleForm(w http.ResponseWriter, r *http.Request) {
 			"Request completed",
 			"This request was already answered.",
 			"You can close this tab.",
+			requestFooter,
 		))
 		return
 	}
@@ -277,4 +290,59 @@ func (s *server) handleResult(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(pollInterval):
 		}
 	}
+}
+
+func (s *server) handleCreateFile(w http.ResponseWriter, r *http.Request) {
+	var upload fileUpload
+	body := http.MaxBytesReader(w, r.Body, maxFileBodyBytes)
+	if err := json.NewDecoder(body).Decode(&upload); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body (files are limited to 512 KiB): "+err.Error())
+		return
+	}
+	if err := validateFileUpload(&upload); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	f, err := s.store.CreateFile(upload)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, createFileResponse{
+		ID:        f.ID,
+		URL:       fmt.Sprintf("%s/f/%s", requestOrigin(r), f.ID),
+		ExpiresAt: f.ExpiresAt.UTC().Format(time.RFC3339),
+		Encrypted: f.Upload.Encrypted != nil,
+	})
+}
+
+func (s *server) handleFilePage(w http.ResponseWriter, r *http.Request) {
+	f := s.store.GetFile(r.PathValue("id"))
+	if f == nil {
+		writePage(w, http.StatusGone, renderMessagePage(
+			"File unavailable",
+			"This file has expired or was deleted.",
+			"Shared files stay on the server for at most 30 minutes. Ask the agent to share it again.",
+			fileFooter,
+		))
+		return
+	}
+	writePage(w, http.StatusOK, renderFilePage(f))
+}
+
+func (s *server) handleGetFile(w http.ResponseWriter, r *http.Request) {
+	f := s.store.GetFile(r.PathValue("id"))
+	if f == nil {
+		writeError(w, http.StatusGone, "File expired or was deleted.")
+		return
+	}
+	writeJSON(w, http.StatusOK, f.Upload)
+}
+
+func (s *server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	if !s.store.DeleteFile(r.PathValue("id")) {
+		writeError(w, http.StatusGone, "File expired or was already deleted.")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
